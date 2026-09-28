@@ -189,6 +189,15 @@ def is_waf_page(text: str) -> bool:
     return ("wzwsquestion" in text or "LZ=" in text) and "waf_zw_verify" in text
 
 
+def is_blocked_page(status_code: int, text: str) -> bool:
+    """判断是否遭遇 403 阻断或网宿静态拦截页面."""
+    if status_code == 403:
+        return True
+    if "<title>403 Forbidden</title>" in text or "403 Forbidden" in text:
+        return True
+    return False
+
+
 def bypass_waf(session: requests.Session, current_url: str, html_content: str, timeout: int = 15) -> bool:
     """
     针对给定的 WAF 拦截页面执行自动穿透，将验证 Cookie 写回 session。
@@ -215,7 +224,11 @@ def bypass_waf(session: requests.Session, current_url: str, html_content: str, t
     verify_headers.update({
         'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
         'Referer': current_url,
-        'Origin': 'https://www.52pojie.cn'
+        'Origin': 'https://www.52pojie.cn',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-origin',
+        'X-Requested-With': 'XMLHttpRequest'
     })
 
     for attempt in range(1, 4):

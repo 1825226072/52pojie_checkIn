@@ -41,9 +41,18 @@ URL_DRAW = f"{BASE_URL}/home.php?mod=task&do=draw&id=2"
 URL_CREDIT = f"{BASE_URL}/home.php?mod=spacecp&ac=credit"
 
 DEFAULT_HEADERS = {
-    'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    'Accept': "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    'Accept': "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     'Accept-Language': "zh-CN,zh;q=0.9,en;q=0.8",
+    'Accept-Encoding': "gzip, deflate, br",
+    'sec-ch-ua': '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+    'sec-ch-ua-mobile': "?0",
+    'sec-ch-ua-platform': '"Windows"',
+    'Sec-Fetch-Dest': "document",
+    'Sec-Fetch-Mode': "navigate",
+    'Sec-Fetch-Site': "none",
+    'Sec-Fetch-User': "?1",
+    'Upgrade-Insecure-Requests': "1",
     'Connection': "close",  # 显式关闭连接，防止跨境长连接被 CDN/WAF 掐断导致 RemoteDisconnected
 }
 
@@ -64,33 +73,53 @@ def create_resilient_session(cookies_dict: Optional[Dict[str, str]] = None) -> r
     return session
 
 
-def safe_request(session: requests.Session, method: str, url: str, max_retries: int = 3, **kwargs) -> requests.Response:
+def safe_request(session: requests.Session, method: str, url: str, max_retries: int = 3, retry_on_403: bool = True, **kwargs) -> requests.Response:
     """
-    自愈型安全网络请求：自动处理连接断开、SSL EOF 与网络抖动并执行退避重试。
+    自愈型安全网络请求：
+    自动处理连接断开、SSL EOF 与网络抖动，并对 HTTP 403 频控/临时阻断执行套接字重置与退避重试。
     """
     kwargs.setdefault('timeout', 25)
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
-            return session.request(method, url, **kwargs)
+            resp = session.request(method, url, **kwargs)
+            # 捕获 HTTP 403 Forbidden 频控/硬阻断特征并执行自愈退避
+            if resp.status_code == 403 and retry_on_403 and attempt < max_retries:
+                wait_sec = 2.5 * attempt + random.uniform(1.0, 2.5)
+                logger.warning(f"请求 {url} 遭遇 HTTP 403 Forbidden（可能触发 CDN/WAF 临时频控），释放连接并等待 {wait_sec:.1f} 秒后重试 ({attempt}/{max_retries})...")
+                session.close()
+                time.sleep(wait_sec)
+                continue
+            return resp
         except (requests.exceptions.RequestException, http.client.RemoteDisconnected, ConnectionResetError) as e:
             last_err = e
             logger.warning(f"请求 {url} 遭遇网络抖动 ({type(e).__name__}): {e}，正在执行第 {attempt}/{max_retries} 次自愈重试...")
             session.close()  # 释放已失效的底层套接字
             if attempt < max_retries:
                 time.sleep(2 * attempt + random.uniform(0.5, 1.5))
-    raise last_err
+    if last_err:
+        raise last_err
+    return resp
 
 
 def fetch_user_assets(session: requests.Session) -> Dict[str, str]:
     """查询用户的资产数据（吾爱币、总积分、用户组）."""
     assets = {"cb": "未知", "credit": "未知", "group": "未知"}
     try:
-        resp = safe_request(session, "GET", URL_CREDIT)
+        credit_headers = session.headers.copy()
+        credit_headers.update({
+            'Referer': URL_HOME,
+            'Sec-Fetch-Site': 'same-origin',
+        })
+        resp = safe_request(session, "GET", URL_CREDIT, headers=credit_headers)
         if waf_solver.is_waf_page(resp.text):
             if waf_solver.bypass_waf(session, URL_CREDIT, resp.text):
-                time.sleep(1.0)
-                resp = safe_request(session, "GET", URL_CREDIT)
+                time.sleep(1.5)
+                resp = safe_request(session, "GET", URL_CREDIT, headers=credit_headers)
+        elif resp.status_code == 403 or "403 Forbidden" in resp.text:
+            logger.warning("获取资产数据遭遇 403 阻断，等待冷却后重试...")
+            time.sleep(random.uniform(2.5, 4.0))
+            resp = safe_request(session, "GET", URL_CREDIT, headers=credit_headers)
 
         if BeautifulSoup:
             soup = BeautifulSoup(resp.text, 'html.parser')
@@ -151,6 +180,8 @@ def check_cookie_validity(cookies: Dict[str, str]) -> Tuple[bool, str]:
 
 def parse_account_username(html: str) -> str:
     """尝试从论坛页面提取当前登录的用户名或 UID."""
+    if not html or "<title>403 Forbidden</title>" in html:
+        return ""
     if BeautifulSoup:
         soup = BeautifulSoup(html, "html.parser")
         user_elem = soup.find("strong", class_="vwmy") or soup.find("a", title="访问我的空间")
@@ -166,8 +197,11 @@ def parse_account_username(html: str) -> str:
     match = re.search(r"home\.php\?mod=space&uid=(\d+)", html)
     if match:
         return f"UID_{match.group(1)}"
-    return "已登录用户"
 
+    # 校验是否为论坛正常 HTML 页面（包含基础论坛关键词）
+    if "吾爱破解" in html or "52pojie" in html or "discuz" in html.lower():
+        return "已登录用户"
+    return ""
 
 
 def check_in_account(account_index: int, cookie_str: str) -> Dict[str, str]:
@@ -190,24 +224,39 @@ def check_in_account(account_index: int, cookie_str: str) -> Dict[str, str]:
     try:
         # 1. 访问首页进行预检
         logger.info(f"[{account_index}] 正在访问论坛首页进行登录与签到预检...")
-        home_resp = safe_request(session, "GET", URL_HOME)
+        home_headers = session.headers.copy()
+        home_headers.update({'Sec-Fetch-Site': 'none'})
+        home_resp = safe_request(session, "GET", URL_HOME, headers=home_headers)
 
-        # 检查首页是否遇到 WAF
+        # 检查首页是否遇到 WAF 挑战盾
         if waf_solver.is_waf_page(home_resp.text):
-            logger.info(f"[{account_index}] 首页触发 WAF 盾，正在求解穿透...")
+            logger.info(f"[{account_index}] 首页触发 WAF 挑战盾，正在求解穿透...")
             if waf_solver.bypass_waf(session, URL_HOME, home_resp.text):
-                time.sleep(1.0)
-                home_resp = safe_request(session, "GET", URL_HOME)
+                time.sleep(2.0)
+                home_resp = safe_request(session, "GET", URL_HOME, headers=home_headers)
             else:
                 return {"index": str(account_index), "user": "未知", "status": "失败", "msg": "首页 WAF 穿透失败"}
 
+        # 检查首页是否遭遇 403 阻断
+        if home_resp.status_code == 403 or "403 Forbidden" in home_resp.text:
+            logger.warning(f"[{account_index}] 首页遭遇 403 Forbidden 阻断，尝试自愈冷却重连...")
+            session.close()
+            time.sleep(random.uniform(3.5, 6.0))
+            home_resp = safe_request(session, "GET", f"{URL_HOME}?_={int(time.time()*1000)}", headers=home_headers)
+            if waf_solver.is_waf_page(home_resp.text):
+                waf_solver.bypass_waf(session, URL_HOME, home_resp.text)
+                time.sleep(2.0)
+                home_resp = safe_request(session, "GET", URL_HOME, headers=home_headers)
+
+        if home_resp.status_code == 403 or "403 Forbidden" in home_resp.text:
+            return {"index": str(account_index), "user": "未知", "status": "失败", "msg": "论坛首页遭遇 403 访问限制 (WAF/CDN阻断)"}
+
         # 检查是否已登录
-        if "您需要先登录才能继续本操作" in home_resp.text or "登录" in home_resp.text and "退出" not in home_resp.text:
-            # 双重核验：有些主题没有明显的退出按钮，看是否有 saltkey 相关表单
+        if "您需要先登录才能继续本操作" in home_resp.text or ("登录" in home_resp.text and "退出" not in home_resp.text):
             if "member.php?mod=logging&action=login" in home_resp.text:
                 return {"index": str(account_index), "user": "未知", "status": "失败", "msg": "Cookie 已失效，请重新获取"}
 
-        username = parse_account_username(home_resp.text)
+        username = parse_account_username(home_resp.text) or "已登录用户"
         logger.info(f"[{account_index}] 账号身份确认: {username}")
 
         status = "成功"
@@ -218,41 +267,65 @@ def check_in_account(account_index: int, cookie_str: str) -> Dict[str, str]:
             status = "成功"
             msg = "今日已签到 (首页状态确认)"
         else:
-            # 预留缓冲间隔，模拟人工点击节奏
-            time.sleep(random.uniform(1.5, 2.5))
+            # 预留充分缓冲间隔，模拟人工点击节奏，规避高频阻断
+            wait_time = random.uniform(2.5, 4.5)
+            logger.info(f"[{account_index}] 预检通过，等待 {wait_time:.1f} 秒后发起任务申请...")
+            time.sleep(wait_time)
 
             # 2. 申请任务 (Apply)
             logger.info(f"[{account_index}] 正在申请签到任务 (id=2)...")
             apply_headers = session.headers.copy()
-            apply_headers.update({'Referer': URL_HOME})
+            apply_headers.update({
+                'Referer': URL_HOME,
+                'Sec-Fetch-Site': 'same-origin',
+            })
             apply_resp = safe_request(session, "GET", URL_APPLY, headers=apply_headers)
 
             # 任务申请页面若遇到 WAF 盾，自动穿透
             if waf_solver.is_waf_page(apply_resp.text):
-                logger.info(f"[{account_index}] 任务申请接口触发 WAF 盾，正在求解穿透...")
+                logger.info(f"[{account_index}] 任务申请接口触发 WAF 挑战盾，正在求解穿透...")
                 if waf_solver.bypass_waf(session, URL_APPLY, apply_resp.text):
-                    time.sleep(1.0)
+                    time.sleep(2.0)
                     logger.info(f"[{account_index}] WAF 穿透成功，重新请求任务申请...")
                     apply_resp = safe_request(session, "GET", URL_APPLY, headers=apply_headers)
                 else:
                     return {"index": str(account_index), "user": username, "status": "失败", "msg": "任务申请接口 WAF 穿透失败", "cb": "未知", "credit": "未知", "group": "未知"}
+            elif apply_resp.status_code == 403 or "403 Forbidden" in apply_resp.text:
+                logger.warning(f"[{account_index}] 任务申请接口遭遇 403 阻断，尝试重新从首页握手刷新 WAF 通行证...")
+                session.close()
+                time.sleep(random.uniform(3.5, 5.5))
+                home_refresh = safe_request(session, "GET", URL_HOME, headers=home_headers)
+                if waf_solver.is_waf_page(home_refresh.text):
+                    waf_solver.bypass_waf(session, URL_HOME, home_refresh.text)
+                    time.sleep(2.0)
+                apply_resp = safe_request(session, "GET", URL_APPLY, headers=apply_headers)
 
-            # 申请与领奖之间留出缓冲间隔
-            time.sleep(random.uniform(1.5, 2.5))
+            # 申请与领奖之间留出从容缓冲间隔（3.0 ~ 5.5 秒）
+            draw_wait = random.uniform(3.0, 5.5)
+            logger.info(f"[{account_index}] 任务申请完毕，等待 {draw_wait:.1f} 秒后领取奖励...")
+            time.sleep(draw_wait)
 
             # 3. 领取签到奖励 (Draw)
             logger.info(f"[{account_index}] 正在领取签到任务奖励...")
             draw_headers = session.headers.copy()
-            draw_headers.update({'Referer': URL_APPLY})
+            draw_headers.update({
+                'Referer': URL_APPLY,
+                'Sec-Fetch-Site': 'same-origin',
+            })
             draw_resp = safe_request(session, "GET", URL_DRAW, headers=draw_headers)
 
             if waf_solver.is_waf_page(draw_resp.text):
-                logger.info(f"[{account_index}] 领奖接口触发 WAF 盾，正在求解穿透...")
+                logger.info(f"[{account_index}] 领奖接口触发 WAF 挑战盾，正在求解穿透...")
                 if waf_solver.bypass_waf(session, URL_DRAW, draw_resp.text):
-                    time.sleep(1.0)
+                    time.sleep(2.0)
                     draw_resp = safe_request(session, "GET", URL_DRAW, headers=draw_headers)
                 else:
                     return {"index": str(account_index), "user": username, "status": "失败", "msg": "领奖接口 WAF 穿透失败", "cb": "未知", "credit": "未知", "group": "未知"}
+            elif draw_resp.status_code == 403 or "403 Forbidden" in draw_resp.text:
+                logger.warning(f"[{account_index}] 领奖接口遭遇 403 阻断，尝试冷却重试...")
+                session.close()
+                time.sleep(random.uniform(4.0, 6.0))
+                draw_resp = safe_request(session, "GET", URL_DRAW, headers=draw_headers)
 
             # 4. 解析结果反馈
             result_text = ""
@@ -267,17 +340,23 @@ def check_in_account(account_index: int, cookie_str: str) -> Dict[str, str]:
                     result_text = m.group(1).strip()
 
             if not result_text:
-                if "您需要先登录才能继续本操作" in draw_resp.text:
+                if draw_resp.status_code == 403 or "403 Forbidden" in draw_resp.text:
+                    status, msg = "失败", "接口触发 403 访问限制 (WAF/CDN 频控阻断)"
+                elif "您需要先登录才能继续本操作" in draw_resp.text:
                     status, msg = "失败", "Cookie 已失效"
                 elif "不是进行中的任务" in draw_resp.text or "今日已签到" in draw_resp.text:
                     status, msg = "成功", "今日已签到"
                 elif "恭喜" in draw_resp.text or "奖励" in draw_resp.text:
                     status, msg = "成功", "签到成功并领取奖励"
                 else:
-                    status, msg = "未知", f"未获取到明确消息: {draw_resp.text[:100]}"
+                    clean_msg = re.sub(r'<[^>]+>', ' ', draw_resp.text).strip()
+                    clean_msg = ' '.join(clean_msg.split())[:60]
+                    status, msg = "未知", f"未获取到明确消息: {clean_msg}"
             else:
                 logger.info(f"[{account_index}] 领奖反馈: {result_text}")
-                if "您需要先登录才能继续本操作" in result_text:
+                if "403 Forbidden" in result_text:
+                    status, msg = "失败", "接口触发 403 访问限制 (WAF/CDN 频控阻断)"
+                elif "您需要先登录才能继续本操作" in result_text:
                     status, msg = "失败", "Cookie 已失效"
                 elif "恭喜" in result_text or "完成" in result_text or "奖励" in result_text:
                     status, msg = "成功", f"签到成功 ({result_text})"
