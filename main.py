@@ -204,6 +204,22 @@ def parse_account_username(html: str) -> str:
     return ""
 
 
+def mask_username(username: str) -> str:
+    """对账号名称进行安全脱敏，避免公开日志泄露真实账号/QQ号."""
+    if not username or username in ("未知", "已登录用户"):
+        return username
+    # 如果是 UID_xxxx 形式
+    if username.startswith("UID_") and len(username) > 6:
+        return f"UID_{username[4:6]}****{username[-2:]}"
+    if len(username) <= 2:
+        return username[0] + "*"
+    elif len(username) <= 4:
+        return username[0] + "**" + username[-1]
+    else:
+        # 保留前2位和后2位，中间用固定星号遮盖（如 qq670607946 -> qq6****46）
+        return f"{username[:3]}****{username[-2:]}"
+
+
 def check_in_account(account_index: int, cookie_str: str) -> Dict[str, str]:
     """执行单个账号的签到流程."""
     cookie_str = cookie_str.strip()
@@ -257,7 +273,7 @@ def check_in_account(account_index: int, cookie_str: str) -> Dict[str, str]:
                 return {"index": str(account_index), "user": "未知", "status": "失败", "msg": "Cookie 已失效，请重新获取"}
 
         username = parse_account_username(home_resp.text) or "已登录用户"
-        logger.info(f"[{account_index}] 账号身份确认: {username}")
+        logger.info(f"[{account_index}] 账号身份确认: {mask_username(username)}")
 
         status = "成功"
         msg = ""
@@ -388,6 +404,38 @@ def check_in_account(account_index: int, cookie_str: str) -> Dict[str, str]:
         return {"index": str(account_index), "user": username, "status": "失败", "msg": f"异常: {e}"}
 
 
+def build_report_text(results_list: List[Dict[str, str]], time_str: str, mask: bool = False) -> str:
+    """生成格式化签到汇报卡片文本，支持公开日志脱敏."""
+    report_lines = [
+        "🔔【52Pojie 每日签到】",
+        "━━━━━━━━━━━━━━━"
+    ]
+    for idx, r in enumerate(results_list):
+        if idx > 0:
+            report_lines.append("───────────────")
+        user_group = r.get('group', '未知')
+        if user_group == '未知':
+            user_group = '会员'
+
+        if r["status"] == "成功":
+            if "已签到" in r["msg"] or "已打卡" in r["msg"]:
+                status_text = "已签到 ✅"
+            else:
+                status_text = "签到成功 ✅"
+        else:
+            status_text = f"签到失败 ❌ ({r['msg']})"
+
+        display_user = mask_username(r['user']) if mask else r['user']
+        report_lines.append(f"👤 账号：{display_user}【{user_group}】")
+        report_lines.append(f"🎉 状态：{status_text}")
+        report_lines.append(f"💰 吾爱币：{r.get('cb', '未知')}")
+
+    report_lines.append("───────────────")
+    report_lines.append(f"⏰ 时间：{time_str}")
+    report_lines.append("━━━━━━━━━━━━━━━")
+    return "\n".join(report_lines)
+
+
 def main():
     logger.info("==========================================")
     logger.info("   吾爱破解（52pojie）自动签到任务启动   ")
@@ -439,39 +487,15 @@ def main():
     tz_beijing = timezone(timedelta(hours=8))
     beijing_time = datetime.now(tz_beijing).strftime("%Y-%m-%d %H:%M:%S")
 
-    # 用户定制模板
-    report_lines = [
-        "🔔【52Pojie 每日签到】",
-        "━━━━━━━━━━━━━━━"
-    ]
-    for idx, r in enumerate(results):
-        if idx > 0:
-            report_lines.append("───────────────")
-        user_group = r.get('group', '未知')
-        if user_group == '未知':
-            user_group = '会员'
+    # 生成私有推送内容（真实账号）与公开展示内容（脱敏账号）
+    private_summary = build_report_text(results, beijing_time, mask=False)
+    public_summary = build_report_text(results, beijing_time, mask=True)
 
-        if r["status"] == "成功":
-            if "已签到" in r["msg"] or "已打卡" in r["msg"]:
-                status_text = "已签到 ✅"
-            else:
-                status_text = "签到成功 ✅"
-        else:
-            status_text = f"签到失败 ❌ ({r['msg']})"
+    # 控制台日志仅输出脱敏版本，彻底杜绝开源后云端控制台泄露账号
+    logger.info("\n" + public_summary)
 
-        report_lines.append(f"👤 账号：{r['user']}【{user_group}】")
-        report_lines.append(f"🎉 状态：{status_text}")
-        report_lines.append(f"💰 吾爱币：{r.get('cb', '未知')}")
-
-    report_lines.append("───────────────")
-    report_lines.append(f"⏰ 时间：{beijing_time}")
-    report_lines.append("━━━━━━━━━━━━━━━")
-
-    summary_text = "\n".join(report_lines)
-    logger.info("\n" + summary_text)
-
-    # 发送推送
-    notify.send("52Pojie 每日签到", summary_text)
+    # 发送推送（私密通道推送 private_summary，公开 Actions Summary 写入 public_summary）
+    notify.send("52Pojie 每日签到", private_summary, public_content=public_summary)
 
     logger.info("所有签到流程处理完毕。")
 

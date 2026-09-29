@@ -69,22 +69,30 @@ def write_github_summary(title: str, content: str):
             logger.debug(f"写入 GITHUB_STEP_SUMMARY 失败: {e}")
 
 
-def send(title: str, content: str):
-    """统一通知分发入口."""
-    logger.info(f"--- 准备推送通知 ---\n标题: {title}\n内容:\n{content}\n----------------")
+def send(title: str, content: str, public_content: str = None):
+    """
+    统一通知分发入口.
+    :param title: 通知标题
+    :param content: 推送到私密渠道（企微/PushPlus）的完整内容
+    :param public_content: 写入 GitHub Actions 公开 Summary 与控制台日志的脱敏内容（若未指定则使用 content）
+    """
+    summary_text = public_content if public_content is not None else content
 
-    # 1. 写入 Actions Summary
-    write_github_summary(title, content)
+    # 1. 写入 Actions 公开 Summary（已脱敏）
+    write_github_summary(title, summary_text)
+
+    # 2. 控制台日志
+    logger.info(f"--- 准备向私有渠道分发推送通知 [{title}] ---")
 
     pushed = False
 
-    # 2. 企业微信机器人 (优先环境变量，回退到默认机器人)
+    # 3. 企业微信机器人 (私有渠道，推送完整内容)
     wecom_webhook = os.environ.get("WECOM_WEBHOOK") or DEFAULT_WECOM_WEBHOOK
     if wecom_webhook:
         send_wecom(wecom_webhook, title, content)
         pushed = True
 
-    # 3. PushPlus 推送
+    # 4. PushPlus 推送 (私有渠道，推送完整内容)
     pushplus_token = os.environ.get("PUSHPLUS_TOKEN")
     if pushplus_token:
         send_pushplus(pushplus_token, title, content)
